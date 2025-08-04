@@ -1,4 +1,12 @@
 # rmse analysis to find optimal sample size - designing shearing experiments
+
+# this script estimates the most efficient sample size for our wet lab work
+# by calculating RMSE for log-log models across increasing sample sizes.
+# 
+# - fits log-log linear models to subsets of each dataset
+# - finds the smallest n where improvement steps drop below 10%
+# - generates a ggplot summary with cutoff shown at n=optimal_n_all
+
 # bpfeiffer@covaris.com, 8/4/25
 
 library(ggplot2)
