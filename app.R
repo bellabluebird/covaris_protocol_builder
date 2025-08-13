@@ -1,5 +1,6 @@
 # dna shearing protocol builder v2
 # built by bella pfeiffer (bpfeiffer@covaris.com)
+# available here: https://bellabluebird.shinyapps.io/covaris_protocol_builder/
 # last updated: 7/21/25
 
 # notes from 7/17 meeting
@@ -18,12 +19,15 @@
 #       - planning an experiment to compare between different analyzers 
 #   - adding additional variables to protocols  (ie water level, z-height, etc)
 
+# bella - to deploy this again
+# 
+
 # load libraries
 if (!require(pacman)) {
   install.packages("pacman")
   library(pacman)
 }
-pacman::p_load(shiny)
+pacman::p_load(shiny, rsconnect)
 
 # define column mappings 
 COLS <- list(
@@ -41,7 +45,11 @@ COLS <- list(
 
 # ui definition
 ui <- fluidPage(
-  titlePanel("DNA Shearing Protocol Builder v1"),
+  tags$head(
+    tags$title("🧬 Covaris Protocol Builder") # tab title for web
+  ),
+  
+  titlePanel("Covaris Protocol Builder"),
   
   sidebarLayout(
     sidebarPanel(
@@ -75,20 +83,19 @@ ui <- fluidPage(
       tabsetPanel(
         # main analysis tab
         tabPanel("Analysis",
-                 fluidRow(
-                   column(7, plotOutput("energy_plot", height = "400px")),
-                   column(5, 
-                          wellPanel(
-                            h4("Prediction"),
-                            verbatimTextOutput("prediction"),
-                            hr(),
-                            h4("Protocol"),
-                            verbatimTextOutput("protocol"),
-                            br(),
-                            downloadButton("download_protocol", "Download Protocol", 
-                                           class = "btn-success", style = "width: 100%;")
-                          ))
-                 )),
+                 plotOutput("energy_plot", height = "600px"),
+                 
+                 wellPanel(
+                   h4("Prediction"),
+                   verbatimTextOutput("prediction"),
+                   hr(),
+                   h4("Protocol"),
+                   verbatimTextOutput("protocol"),
+                   br(),
+                   downloadButton("download_protocol", "Download Protocol", 
+                                  class = "btn-success", style = "width: 100%;")
+                 )
+          ),
         
         # equations overview tab
         tabPanel("All Models",
