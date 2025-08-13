@@ -1,7 +1,14 @@
 # dna shearing protocol builder v2
 # built by bella pfeiffer (bpfeiffer@covaris.com)
 # available here: https://bellabluebird.shinyapps.io/covaris_protocol_builder/
-# last updated: 7/21/25
+# last updated: 8/13/25
+
+# bella - for SQLite database updates
+# > setwd("C:/Users/bpfeiffer/Desktop/programming_projects/Protocol_Builder_RShiny/app")
+# > con <- dbConnect(RSQLite::SQLite(), "data/database.sqlite")
+# > my_data <- read.csv("data/data_protocols_local.csv")
+# > dbWriteTable(con, "data_protocols", my_data, overwrite = TRUE)
+# > dbDisconnect(con)
 
 # notes from 7/17 meeting
 # needs for future development (from Julie + Katelyn)
@@ -19,15 +26,12 @@
 #       - planning an experiment to compare between different analyzers 
 #   - adding additional variables to protocols  (ie water level, z-height, etc)
 
-# bella - to deploy this again
-# 
-
 # load libraries
 if (!require(pacman)) {
   install.packages("pacman")
   library(pacman)
 }
-pacman::p_load(shiny, rsconnect)
+pacman::p_load(shiny, rsconnect, DBI, RSQLite, dplyr)
 
 # define column mappings 
 COLS <- list(
@@ -43,29 +47,30 @@ COLS <- list(
   energy = 17
 )
 
-# ui definition
+# ui definition - removed csv upload, switching to sqlite
 ui <- fluidPage(
   tags$head(
     tags$title("🧬 Covaris Protocol Builder") # tab title for web
   ),
   
-  titlePanel("Covaris Protocol Builder"),
+  titlePanel("🧬 Covaris Protocol Builder"),
   
   sidebarLayout(
     sidebarPanel(
-      fileInput("datafile", "Choose CSV File", accept = c(".csv")),
+      # Show data loading status
+      verbatimTextOutput("data_status"),
       hr(),
       
       # dynamic dropdowns
       selectInput("device", "Select Device:", 
-                  choices = list("Upload data first" = "")),
+                  choices = list("Loading data..." = "")),
       selectInput("vessel", "Select Vessel:", 
                   choices = list("Select device first" = "")),
       selectInput("volume", "Select Sample Volume:",
                   choices = list("Select vessel first" = "")),
       radioButtons("protocol_type", "Protocol Type:",
                    choices = c("Continuous" = "Continuous",
-                               "Pulsing (Majority Not Availab)" = "Pulsing"),
+                               "Pulsing (Majority Not Available)" = "Pulsing"),
                    selected = "Continuous"),
       
       # target selection
@@ -74,7 +79,7 @@ ui <- fluidPage(
       actionButton("calculate", "Calculate Energy", class = "btn-primary"),
       
       hr(),
-      # simplified status display
+      # status display
       h4("Model Status"),
       verbatimTextOutput("model_summary")
     ),
@@ -95,7 +100,7 @@ ui <- fluidPage(
                    downloadButton("download_protocol", "Download Protocol", 
                                   class = "btn-success", style = "width: 100%;")
                  )
-          ),
+        ),
         
         # equations overview tab
         tabPanel("All Models",
@@ -119,8 +124,86 @@ server <- function(input, output, session) {
   values <- reactiveValues(
     data = NULL,
     current_model = NULL,
-    all_models = NULL
+    all_models = NULL,
+    data_loaded = FALSE,
+    error_message = NULL
   )
+  
+  # loading in data from sqlite database
+  observe({
+    tryCatch({
+      # different paths bc i'm learning and need to double check lol
+      possible_paths <- c(
+        "data/database.sqlite",
+        "./data/database.sqlite",
+        "database.sqlite",
+        "./database.sqlite"
+      )
+      
+      db_path <- NULL
+      for(path in possible_paths) {
+        if(file.exists(path)) {
+          db_path <- path
+          break
+        }
+      }
+      
+      if(is.null(db_path)) {
+        values$error_message <- "Database file not found. Checked paths: data/database.sqlite, ./data/database.sqlite, database.sqlite, ./database.sqlite"
+        return()
+      }
+      
+      con <- dbConnect(RSQLite::SQLite(), db_path)
+      
+      # sanity check if table exists
+      if(!"data_protocols" %in% dbListTables(con)) {
+        dbDisconnect(con)
+        values$error_message <- "Table 'data_protocols' not found in database"
+        return()
+      }
+      
+      df <- dbReadTable(con, "data_protocols")
+      dbDisconnect(con)
+      
+      # sanity check data structure
+      if(ncol(df) < 17) {
+        values$error_message <- paste("Database has insufficient columns:", ncol(df), "found, 17 required")
+        return()
+      }
+      
+      # add protocol type
+      df$protocol_type <- ifelse(!is.na(df[, COLS$cycles]) & !is.na(df[, COLS$iterations]), 
+                                 "Pulsing", "Continuous")
+      
+      values$data <- df
+      values$data_loaded <- TRUE
+      values$error_message <- NULL
+      
+      # update device dropdown
+      devices <- unique(df[, COLS$device])
+      devices <- devices[!is.na(devices)]
+      if(length(devices) > 0) {
+        updateSelectInput(session, "device", choices = devices, selected = devices[1])
+      } else {
+        values$error_message <- "No valid devices found in database"
+      }
+      
+    }, error = function(e) {
+      values$error_message <- paste("Database error:", e$message)
+      values$data_loaded <- FALSE
+    })
+  })
+  
+  # data loading status output
+  output$data_status <- renderText({
+    if(values$data_loaded) {
+      paste("✓ Data loaded successfully:", nrow(values$data), "records")
+    } else if(!is.null(values$error_message)) {
+      paste("✗ Error:", values$error_message)
+    } else {
+      "Loading data..."
+    }
+  })
   
   # helper functions
   
@@ -139,13 +222,6 @@ server <- function(input, output, session) {
     }
     
     return(list(valid = TRUE))
-  }
-  
-  # add protocol type to data
-  add_protocol_type <- function(df) {
-    df$protocol_type <- ifelse(!is.na(df[, COLS$cycles]) & !is.na(df[, COLS$iterations]), 
-                               "Pulsing", "Continuous")
-    df
   }
   
   # filter data by selections 
@@ -290,51 +366,38 @@ server <- function(input, output, session) {
     )
   }
   
-  # file upload handler
-  observeEvent(input$datafile, {
-    req(input$datafile)
-    
-    df <- read.csv(input$datafile$datapath, stringsAsFactors = FALSE)
-    
-    # validate
-    validation <- validate_csv(df)
-    if(!validation$valid) {
-      showNotification(validation$message, type = "error")
-      return()
-    }
-    
-    # add protocol type and store
-    values$data <- add_protocol_type(df)
-    
-    # update device dropdown
-    devices <- unique(df[, COLS$device])
-    updateSelectInput(session, "device", choices = devices, selected = devices[1])
-  })
-  
   # device change handler
   observeEvent(input$device, {
-    req(values$data, input$device)
+    req(values$data, input$device, values$data_loaded)
     
     # get vessels for this device
     device_data <- values$data[values$data[, COLS$device] == input$device, ]
     vessels <- unique(device_data[, COLS$vessel])
-    updateSelectInput(session, "vessel", choices = vessels, selected = vessels[1])
+    vessels <- vessels[!is.na(vessels)]
+    
+    if(length(vessels) > 0) {
+      updateSelectInput(session, "vessel", choices = vessels, selected = vessels[1])
+    }
   })
   
   # vessel change handler
   observeEvent(input$vessel, {
-    req(values$data, input$device, input$vessel)
+    req(values$data, input$device, input$vessel, values$data_loaded)
     
     # get volumes for this device/vessel combination
     device_vessel_data <- values$data[values$data[, COLS$device] == input$device & 
                                         values$data[, COLS$vessel] == input$vessel, ]
     volumes <- sort(unique(as.numeric(device_vessel_data[, COLS$volume])))
-    updateSelectInput(session, "volume", choices = volumes, selected = volumes[1])
+    volumes <- volumes[!is.na(volumes)]
+    
+    if(length(volumes) > 0) {
+      updateSelectInput(session, "volume", choices = volumes, selected = volumes[1])
+    }
   })
   
-  # calculate button handler (updated)
+  # calculate button handler
   observeEvent(input$calculate, {
-    req(values$data, input$device, input$vessel, input$volume)
+    req(values$data, input$device, input$vessel, input$volume, values$data_loaded)
     
     # filter data
     filtered <- filter_data(values$data, input$device, input$vessel, 
@@ -359,16 +422,16 @@ server <- function(input, output, session) {
     values$all_models <- calculate_all_models()
   })
   
-  # calculate all models for export (updated)
+  # calculate all models for export
   calculate_all_models <- reactive({
-    req(values$data)
+    req(values$data, values$data_loaded)
     
     combos <- unique(values$data[, c(COLS$device, COLS$vessel, COLS$volume)])
     results <- list()
     
     # show progress
     withProgress(message = 'Calculating equations', value = 0, {
-      total_steps <- nrow(combos) * 3  # 3 protocol types per combo
+      total_steps <- nrow(combos) * 3 
       current_step <- 0
       
       for(i in 1:nrow(combos)) {
@@ -387,7 +450,7 @@ server <- function(input, output, session) {
             filtered <- filter_data(values$data, device, vessel, volume, protocol)
           }
           
-          # Initialize result entry with ALL possible columns
+          # initialize result entry with ALL possible columns
           result_row <- data.frame(
             device = device,
             vessel = vessel,
@@ -455,10 +518,9 @@ server <- function(input, output, session) {
     cat("BP range:", paste(round(attr(model, "data_range")), collapse = "-"), "\n")
   })
   
-  # main plot (updated)
-  # main plot (updated with error handling)
+  # main plot with better error handling
   output$energy_plot <- renderPlot({
-    req(values$data, input$device, input$vessel, input$volume)
+    req(values$data, input$device, input$vessel, input$volume, values$data_loaded)
     
     # get all data for device/vessel/volume (not filtered by protocol)
     all_data <- values$data[values$data[, COLS$device] == input$device & 
@@ -476,14 +538,14 @@ server <- function(input, output, session) {
     energy_all <- energy_all[valid]
     protocol_all <- protocol_all[valid]
     
-    # Check if we have any valid data points
+    # check if we have any valid data points
     if(length(energy_all) == 0) {
       plot(NULL, NULL,
            main = paste(input$device, "-", input$vessel, "-", input$volume, "μL"),
            xlab = "Base Pair (bp)",
            ylab = "Energy (J)",
            xlim = c(100, 1500),
-           ylim = c(0, 100))  # fallback range
+           ylim = c(0, 100))
       text(500, 50, "No valid data for this combination", cex = 1.2, col = "red")
       return()
     }
@@ -494,7 +556,7 @@ server <- function(input, output, session) {
          xlab = "Base Pair (bp)",
          ylab = "Energy (J)",
          xlim = range(100, 1500),
-         ylim = range(energy_all))  # Now safe to use since we checked length > 0
+         ylim = range(energy_all))
     
     # plot points based on protocol selection
     if(input$protocol_type == "Continuous") {
@@ -546,7 +608,8 @@ server <- function(input, output, session) {
     # add data count
     n_shown <- sum(protocol_all == input$protocol_type)
     mtext(paste("Showing", n_shown, "points"), side = 3, line = 0.5, cex = 0.8)
-  })  
+  })
+  
   # prediction output
   output$prediction <- renderPrint({
     req(values$current_model)
@@ -564,7 +627,7 @@ server <- function(input, output, session) {
     }
   })
   
-  # protocol output (updated)
+  # protocol output
   output$protocol <- renderPrint({
     req(values$current_model, values$data, input$volume)
     
@@ -674,11 +737,11 @@ server <- function(input, output, session) {
     }
   })
   
-  # equations table (updated)
+  # equations table
   output$equations_table <- renderTable({
     req(values$all_models)
     
-    # select columns to display (including volume)
+    # select columns to display
     display_cols <- c("device", "vessel", "volume", "protocol", "model_type", 
                       "n_points", "n_pulsing", "n_continuous",
                       "aic", "r_squared", "equation", "status")
@@ -698,7 +761,7 @@ server <- function(input, output, session) {
     }
   )
   
-  # example curves plot (updated)
+  # example curves plot - GETTING RID OF THIS SOON
   output$example_curves <- renderPlot({
     req(values$all_models)
     
@@ -766,7 +829,7 @@ server <- function(input, output, session) {
     par(mfrow = c(1, 1))
   })
   
-  # download protocol handler (updated)
+  # download protocol handler
   output$download_protocol <- downloadHandler(
     filename = function() {
       req(input$device, input$vessel, input$volume, input$target_bp)
@@ -781,7 +844,7 @@ server <- function(input, output, session) {
     content = function(file) {
       req(values$current_model, values$data, input$volume)
       
-      # Get prediction and protocol data
+      # get prediction and protocol data
       pred <- predict_energy(values$current_model, input$target_bp)
       filtered <- filter_data(values$data, input$device, input$vessel, 
                               as.numeric(input$volume), input$protocol_type)
@@ -792,21 +855,21 @@ server <- function(input, output, session) {
         return()
       }
       
-      # Create formatted protocol text
+      # create formatted protocol text
       protocol_text <- c(
         "========================================",
         "     DNA SHEARING PROTOCOL",
         "========================================",
         "",
         paste("Generated:", Sys.time()),
-        paste("Protocol Builder v1 - Covaris"),
+        paste("Protocol Builder v2 - Covaris"),
         paste("Generated by:", Sys.getenv("USER", "User")),
         "",
         "EXPERIMENTAL PARAMETERS",
         "----------------------",
         paste("Device:", input$device),
         paste("Vessel:", input$vessel),
-        paste("Sample Volume:", input$volume, "μL"),  # Added volume
+        paste("Sample Volume:", input$volume, "μL"),
         paste("Protocol Type:", input$protocol_type),
         paste("Target Fragment Size:", input$target_bp, "bp"),
         paste("Target Energy:", round(pred$fit, 0), "J"),
@@ -822,7 +885,7 @@ server <- function(input, output, session) {
         ""
       )
       
-      # Add prediction intervals
+      # add prediction intervals
       protocol_text <- c(protocol_text,
                          "ENERGY PREDICTION",
                          "-----------------",
@@ -834,7 +897,7 @@ server <- function(input, output, session) {
                          ""
       )
       
-      # Add extrapolation warning if needed
+      # add extrapolation warning if needed
       if(pred$extrapolating) {
         protocol_text <- c(protocol_text,
                            "⚠️  WARNING: EXTRAPOLATION DETECTED",
@@ -844,7 +907,7 @@ server <- function(input, output, session) {
         )
       }
       
-      # Add main protocol parameters
+      # add main protocol parameters - this download will be prettier in the future
       protocol_text <- c(protocol_text,
                          "========================================",
                          "        RECOMMENDED PROTOCOL",
@@ -869,7 +932,7 @@ server <- function(input, output, session) {
                          ""
       )
       
-      # Add pulsing parameters if applicable
+      # add pulsing parameters if applicable
       if(input$protocol_type == "Pulsing") {
         raw_data <- filtered$raw
         valid <- !is.na(raw_data[, COLS$energy])
@@ -890,7 +953,7 @@ server <- function(input, output, session) {
         }
       }
       
-      # Add warnings if any
+      # add warnings if any
       if(length(protocol$warnings) > 0) {
         protocol_text <- c(protocol_text,
                            "⚠️  WARNINGS",
@@ -900,7 +963,7 @@ server <- function(input, output, session) {
         )
       }
       
-      # Add footer
+      # add footer
       protocol_text <- c(protocol_text,
                          "========================================",
                          "             IMPORTANT NOTES",
@@ -914,11 +977,11 @@ server <- function(input, output, session) {
                          "",
                          "For technical support, contact: bpfeiffer@covaris.com",
                          "",
-                         paste("Protocol generated by DNA Shearing Protocol Builder v1"),
+                         paste("Protocol generated by DNA Shearing Protocol Builder v2"),
                          paste("File created:", Sys.time())
       )
       
-      # Write to file
+      # write to file
       writeLines(protocol_text, file)
     }
   )
