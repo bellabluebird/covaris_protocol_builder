@@ -1,7 +1,7 @@
 # dna shearing protocol builder v2
 # built by bella pfeiffer (bpfeiffer@covaris.com)
 # available here: https://bellabluebird.shinyapps.io/covaris_protocol_builder/
-# last updated: 8/13/25
+# last updated: 7/21/25
 
 # bella - for SQLite database updates
 # > setwd("C:/Users/bpfeiffer/Desktop/programming_projects/Protocol_Builder_RShiny/app")
@@ -31,7 +31,7 @@ if (!require(pacman)) {
   install.packages("pacman")
   library(pacman)
 }
-pacman::p_load(shiny, rsconnect, DBI, RSQLite, dplyr)
+pacman::p_load(shiny, rsconnect, DBI, RSQLite, dplyr, digest)
 
 # define column mappings 
 COLS <- list(
@@ -47,74 +47,17 @@ COLS <- list(
   energy = 17
 )
 
-# ui definition - removed csv upload, switching to sqlite
+# password setup
+password <- Sys.getenv("COVARIS_PASSWORD", "covaris2025")
+password_hash <- digest(password, algo = "sha256")
+
+# ui definition
 ui <- fluidPage(
   tags$head(
-    tags$title("🧬 Covaris Protocol Builder") # tab title for web
+    tags$title("🧬 Covaris Protocol Builder")
   ),
   
-  titlePanel("🧬 Covaris Protocol Builder"),
-  
-  sidebarLayout(
-    sidebarPanel(
-      # Show data loading status
-      verbatimTextOutput("data_status"),
-      hr(),
-      
-      # dynamic dropdowns
-      selectInput("device", "Select Device:", 
-                  choices = list("Loading data..." = "")),
-      selectInput("vessel", "Select Vessel:", 
-                  choices = list("Select device first" = "")),
-      selectInput("volume", "Select Sample Volume:",
-                  choices = list("Select vessel first" = "")),
-      radioButtons("protocol_type", "Protocol Type:",
-                   choices = c("Continuous" = "Continuous",
-                               "Pulsing (Majority Not Available)" = "Pulsing"),
-                   selected = "Continuous"),
-      
-      # target selection
-      sliderInput("target_bp", "Target Base Pair (bp):", 
-                  min = 100, max = 1500, value = 500, step = 25),
-      actionButton("calculate", "Calculate Energy", class = "btn-primary"),
-      
-      hr(),
-      # status display
-      h4("Model Status"),
-      verbatimTextOutput("model_summary")
-    ),
-    
-    mainPanel(
-      tabsetPanel(
-        # main analysis tab
-        tabPanel("Analysis",
-                 plotOutput("energy_plot", height = "600px"),
-                 
-                 wellPanel(
-                   h4("Prediction"),
-                   verbatimTextOutput("prediction"),
-                   hr(),
-                   h4("Protocol"),
-                   verbatimTextOutput("protocol"),
-                   br(),
-                   downloadButton("download_protocol", "Download Protocol", 
-                                  class = "btn-success", style = "width: 100%;")
-                 )
-        ),
-        
-        # equations overview tab
-        tabPanel("All Models",
-                 h4("Model Summary"),
-                 verbatimTextOutput("summary_stats"),
-                 hr(),
-                 tableOutput("equations_table"),
-                 downloadButton("download_equations", "Download Equations"),
-                 hr(),
-                 h4("Example Model Curves"),
-                 plotOutput("example_curves", height = "600px"))
-      )
-    )
-  )
+  uiOutput("main_ui")
 )
 
 # server logic
@@ -122,6 +65,7 @@ server <- function(input, output, session) {
   
   # reactive values to store state
   values <- reactiveValues(
+    authenticated = FALSE,
     data = NULL,
     current_model = NULL,
     all_models = NULL,
@@ -129,99 +73,56 @@ server <- function(input, output, session) {
     error_message = NULL
   )
   
-  # loading in data from sqlite database
-  observe({
-    tryCatch({
-      # different paths bc i'm learning and need to double check lol
-      possible_paths <- c(
-        "data/database.sqlite",
-        "./data/database.sqlite",
-        "database.sqlite",
-        "./database.sqlite"
-      )
-      
-      db_path <- NULL
-      for(path in possible_paths) {
-        if(file.exists(path)) {
-          db_path <- path
-          break
-        }
-      }
-      
-      if(is.null(db_path)) {
-        values$error_message <- "Database file not found. Checked paths: data/database.sqlite, ./data/database.sqlite, database.sqlite, ./database.sqlite"
-        return()
-      }
-      
-      con <- dbConnect(RSQLite::SQLite(), db_path)
-      
-      # sanity check if table exists
-      if(!"data_protocols" %in% dbListTables(con)) {
-        dbDisconnect(con)
-        values$error_message <- "Table 'data_protocols' not found in database"
-        return()
-      }
-      
-      df <- dbReadTable(con, "data_protocols")
-      dbDisconnect(con)
-      
-      # sanity check data structure
-      if(ncol(df) < 17) {
-        values$error_message <- paste("Database has insufficient columns:", ncol(df), "found, 17 required")
-        return()
-      }
-      
-      # add protocol type
-      df$protocol_type <- ifelse(!is.na(df[, COLS$cycles]) & !is.na(df[, COLS$iterations]), 
-                                 "Pulsing", "Continuous")
-      
-      values$data <- df
-      values$data_loaded <- TRUE
-      values$error_message <- NULL
-      
-      # update device dropdown
-      devices <- unique(df[, COLS$device])
-      devices <- devices[!is.na(devices)]
-      if(length(devices) > 0) {
-        updateSelectInput(session, "device", choices = devices, selected = devices[1])
-      } else {
-        values$error_message <- "No valid devices found in database"
-      }
-      
-    }, error = function(e) {
-      values$error_message <- paste("Database error:", e$message)
-      values$data_loaded <- FALSE
-    })
-  })
-  
-  # data loading status output
-  output$data_status <- renderText({
-    if(values$data_loaded) {
-      paste("✓ Data loaded successfully:", nrow(values$data), "records")
-    } else if(!is.null(values$error_message)) {
-      paste("✗ Error:", values$error_message)
-    } else {
-      "Loading data..."
-    }
-  })
-  
   # helper functions
   
-  # validate uploaded csv
-  validate_csv <- function(df) {
-    if(ncol(df) < 17) {
-      return(list(valid = FALSE, message = "CSV must have at least 17 columns"))
-    }
+  # check password
+  check_password <- function(pwd) {
+    if(is.null(pwd) || pwd == "") return(FALSE)
+    digest(pwd, algo = "sha256") == password_hash
+  }
+  
+  # get database connection with error handling
+  get_database_data <- function() {
+    possible_paths <- c(
+      "data/database.sqlite",
+      "./data/database.sqlite", 
+      "database.sqlite",
+      "./database.sqlite"
+    )
     
-    # check numeric columns
-    numeric_cols <- c(COLS$volume, COLS$bp_mode, COLS$pip, COLS$duty_factor, COLS$duration, COLS$energy)
-    for(col in numeric_cols) {
-      if(!all(is.na(df[, col]) | !is.na(as.numeric(df[, col])))) {
-        return(list(valid = FALSE, message = paste("Column", col, "must be numeric")))
+    for(path in possible_paths) {
+      if(file.exists(path)) {
+        tryCatch({
+          con <- dbConnect(RSQLite::SQLite(), path)
+          
+          if(!"data_protocols" %in% dbListTables(con)) {
+            dbDisconnect(con)
+            next
+          }
+          
+          df <- dbReadTable(con, "data_protocols")
+          dbDisconnect(con)
+          
+          if(ncol(df) < 17) {
+            next
+          }
+          
+          return(list(success = TRUE, data = df))
+        }, error = function(e) {
+          if(exists("con")) dbDisconnect(con)
+          next
+        })
       }
     }
     
-    return(list(valid = TRUE))
+    return(list(success = FALSE, message = "Database file not found or invalid"))
+  }
+  
+  # add protocol type to data
+  add_protocol_type <- function(df) {
+    df$protocol_type <- ifelse(!is.na(df[, COLS$cycles]) & !is.na(df[, COLS$iterations]), 
+                               "Pulsing", "Continuous")
+    df
   }
   
   # filter data by selections 
@@ -259,38 +160,25 @@ server <- function(input, output, session) {
     
     df_model <- data.frame(bp_mode = bp, energy_j = energy)
     
-    # fit candidate models
-    models <- list()
+    # fit power model (only model type for now)
     tryCatch({
-      models$power <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
+      model <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
+      
+      # add metadata
+      attr(model, "model_type") <- "power"
+      attr(model, "data_range") <- range(bp)
+      attr(model, "bp_data") <- bp
+      attr(model, "energy_data") <- energy
+      
+      list(success = TRUE, model = model, name = "power")
     }, error = function(e) {
-      return(list(success = FALSE, message = e$message))
+      list(success = FALSE, message = e$message)
     })
-    
-    # select best by aic
-    aics <- sapply(models, function(m) tryCatch(AIC(m), error = function(e) Inf))
-    best_name <- names(which.min(aics))
-    best_model <- models[[best_name]]
-    
-    # add metadata
-    attr(best_model, "model_type") <- best_name
-    attr(best_model, "data_range") <- range(bp)
-    attr(best_model, "bp_data") <- bp
-    attr(best_model, "energy_data") <- energy
-    
-    list(success = TRUE, model = best_model, name = best_name)
   }
   
   # predict with intervals
   predict_energy <- function(model, bp_target) {
-    model_type <- attr(model, "model_type")
-    
-    # create appropriate prediction dataframe
-    if(model_type == "power") {
-      pred_df <- data.frame(bp_mode = bp_target)
-    } else {
-      pred_df <- data.frame(bp_mode = bp_target)
-    }
+    pred_df <- data.frame(bp_mode = bp_target)
     
     # get predictions with both confidence and prediction intervals
     log_conf <- predict(model, newdata = pred_df, interval = "confidence", level = 0.95)
@@ -311,12 +199,7 @@ server <- function(input, output, session) {
   # format equation string
   format_equation <- function(model) {
     coefs <- coef(model)
-    model_type <- attr(model, "model_type")
-    
-    switch(model_type,
-           "power" = sprintf("E = exp(%.3f) * bp^%.3f", coefs[1], coefs[2]),
-           "unknown"
-    )
+    sprintf("E = exp(%.3f) * bp^%.3f", coefs[1], coefs[2])
   }
   
   # calculate protocol parameters
@@ -366,9 +249,144 @@ server <- function(input, output, session) {
     )
   }
   
+  # authentication handlers
+  observeEvent(input$login_btn, {
+    if(check_password(input$password)) {
+      values$authenticated <- TRUE
+      updateTextInput(session, "password", value = "")
+    } else {
+      updateTextInput(session, "password", value = "")
+      showNotification("Incorrect password", type = "error")
+    }
+  })
+  
+  observeEvent(input$logout_btn, {
+    values$authenticated <- FALSE
+  })
+  
+  # main ui renderer
+  output$main_ui <- renderUI({
+    if(!values$authenticated) {
+      div(style = "max-width: 400px; margin: 100px auto; padding: 30px; border: 1px solid #ddd; border-radius: 10px;",
+          h2("🧬 Covaris Protocol Builder", style = "text-align: center;"),
+          p("Please enter password:", style = "text-align: center; color: #666;"),
+          br(),
+          passwordInput("password", "Password:", width = "100%"),
+          br(),
+          actionButton("login_btn", "Login", class = "btn-primary", style = "width: 100%;")
+      )
+    } else {
+      tagList(
+        div(style = "position: absolute; top: 10px; right: 10px;",
+            actionButton("logout_btn", "Logout", class = "btn-default btn-sm")
+        ),
+        
+        titlePanel("Covaris Protocol Builder"),
+        
+        sidebarLayout(
+          sidebarPanel(
+            # show data loading status
+            verbatimTextOutput("data_status"),
+            hr(),
+            
+            # dynamic dropdowns
+            selectInput("device", "Select Device:", 
+                        choices = list("Loading data..." = "")),
+            selectInput("vessel", "Select Vessel:", 
+                        choices = list("Select device first" = "")),
+            selectInput("volume", "Select Sample Volume:",
+                        choices = list("Select vessel first" = "")),
+            radioButtons("protocol_type", "Protocol Type:",
+                         choices = c("Continuous" = "Continuous",
+                                     "Pulsing (Majority Not Available)" = "Pulsing"),
+                         selected = "Continuous"),
+            
+            # target selection
+            sliderInput("target_bp", "Target Base Pair (bp):", 
+                        min = 100, max = 1500, value = 500, step = 25),
+            actionButton("calculate", "Calculate Energy", class = "btn-primary"),
+            
+            hr(),
+            # simplified status display
+            h4("Model Status"),
+            verbatimTextOutput("model_summary")
+          ),
+          
+          mainPanel(
+            tabsetPanel(
+              # main analysis tab
+              tabPanel("Analysis",
+                       plotOutput("energy_plot", height = "600px"),
+                       
+                       wellPanel(
+                         h4("Prediction"),
+                         verbatimTextOutput("prediction"),
+                         hr(),
+                         h4("Protocol"),
+                         verbatimTextOutput("protocol"),
+                         br(),
+                         downloadButton("download_protocol", "Download Protocol", 
+                                        class = "btn-success", style = "width: 100%;")
+                       )
+              ),
+              
+              # equations overview tab
+              tabPanel("All Models",
+                       h4("Model Summary"),
+                       verbatimTextOutput("summary_stats"),
+                       hr(),
+                       tableOutput("equations_table"),
+                       downloadButton("download_equations", "Download Equations"),
+                       hr(),
+                       h4("Example Model Curves"),
+                       plotOutput("example_curves", height = "600px"))
+            )
+          )
+        )
+      )
+    }
+  })
+  
+  # load data from database
+  observe({
+    req(values$authenticated)
+    
+    result <- get_database_data()
+    
+    if(result$success) {
+      values$data <- add_protocol_type(result$data)
+      values$data_loaded <- TRUE
+      values$error_message <- NULL
+      
+      # update device dropdown
+      devices <- unique(values$data[, COLS$device])
+      devices <- devices[!is.na(devices)]
+      if(length(devices) > 0) {
+        updateSelectInput(session, "device", choices = devices, selected = devices[1])
+      } else {
+        values$error_message <- "No valid devices found in database"
+      }
+    } else {
+      values$error_message <- result$message
+      values$data_loaded <- FALSE
+    }
+  })
+  
+  # data loading status output
+  output$data_status <- renderText({
+    req(values$authenticated)
+    if(values$data_loaded) {
+      paste("✓ Data loaded successfully:", nrow(values$data), "records")
+    } else if(!is.null(values$error_message)) {
+      paste("✗ Error:", values$error_message)
+    } else {
+      "Loading data..."
+    }
+  })
+  
   # device change handler
   observeEvent(input$device, {
-    req(values$data, input$device, values$data_loaded)
+    req(values$data, input$device, values$data_loaded, values$authenticated)
     
     # get vessels for this device
     device_data <- values$data[values$data[, COLS$device] == input$device, ]
@@ -382,7 +400,7 @@ server <- function(input, output, session) {
   
   # vessel change handler
   observeEvent(input$vessel, {
-    req(values$data, input$device, input$vessel, values$data_loaded)
+    req(values$data, input$device, input$vessel, values$data_loaded, values$authenticated)
     
     # get volumes for this device/vessel combination
     device_vessel_data <- values$data[values$data[, COLS$device] == input$device & 
@@ -397,7 +415,7 @@ server <- function(input, output, session) {
   
   # calculate button handler
   observeEvent(input$calculate, {
-    req(values$data, input$device, input$vessel, input$volume, values$data_loaded)
+    req(values$data, input$device, input$vessel, input$volume, values$data_loaded, values$authenticated)
     
     # filter data
     filtered <- filter_data(values$data, input$device, input$vessel, 
@@ -424,14 +442,14 @@ server <- function(input, output, session) {
   
   # calculate all models for export
   calculate_all_models <- reactive({
-    req(values$data, values$data_loaded)
+    req(values$data, values$data_loaded, values$authenticated)
     
     combos <- unique(values$data[, c(COLS$device, COLS$vessel, COLS$volume)])
     results <- list()
     
     # show progress
     withProgress(message = 'Calculating equations', value = 0, {
-      total_steps <- nrow(combos) * 3 
+      total_steps <- nrow(combos) * 3  # 3 protocol types per combo
       current_step <- 0
       
       for(i in 1:nrow(combos)) {
@@ -450,7 +468,7 @@ server <- function(input, output, session) {
             filtered <- filter_data(values$data, device, vessel, volume, protocol)
           }
           
-          # initialize result entry with ALL possible columns
+          # initialize result entry
           result_row <- data.frame(
             device = device,
             vessel = vessel,
@@ -502,13 +520,12 @@ server <- function(input, output, session) {
       }
     })
     
-    # Now all data frames have the same structure, so rbind will work
     do.call(rbind, results)
   })
   
   # model summary
   output$model_summary <- renderPrint({
-    req(values$current_model)
+    req(values$current_model, values$authenticated)
     model <- values$current_model
     
     cat("Model:", attr(model, "model_type"), "\n")
@@ -518,9 +535,9 @@ server <- function(input, output, session) {
     cat("BP range:", paste(round(attr(model, "data_range")), collapse = "-"), "\n")
   })
   
-  # main plot with better error handling
+  # main plot
   output$energy_plot <- renderPlot({
-    req(values$data, input$device, input$vessel, input$volume, values$data_loaded)
+    req(values$data, input$device, input$vessel, input$volume, values$data_loaded, values$authenticated)
     
     # get all data for device/vessel/volume (not filtered by protocol)
     all_data <- values$data[values$data[, COLS$device] == input$device & 
@@ -612,7 +629,7 @@ server <- function(input, output, session) {
   
   # prediction output
   output$prediction <- renderPrint({
-    req(values$current_model)
+    req(values$current_model, values$authenticated)
     
     pred <- predict_energy(values$current_model, input$target_bp)
     
@@ -629,7 +646,7 @@ server <- function(input, output, session) {
   
   # protocol output
   output$protocol <- renderPrint({
-    req(values$current_model, values$data, input$volume)
+    req(values$current_model, values$data, input$volume, values$authenticated)
     
     # get prediction
     pred <- predict_energy(values$current_model, input$target_bp)
@@ -693,7 +710,7 @@ server <- function(input, output, session) {
   
   # summary stats
   output$summary_stats <- renderPrint({
-    req(values$all_models)
+    req(values$all_models, values$authenticated)
     
     models <- values$all_models
     successful <- models[models$status == "success", ]
@@ -739,7 +756,7 @@ server <- function(input, output, session) {
   
   # equations table
   output$equations_table <- renderTable({
-    req(values$all_models)
+    req(values$all_models, values$authenticated)
     
     # select columns to display
     display_cols <- c("device", "vessel", "volume", "protocol", "model_type", 
@@ -751,19 +768,20 @@ server <- function(input, output, session) {
     values$all_models[, available_cols]
   })
   
-  # download handler
+  # download equations handler
   output$download_equations <- downloadHandler(
     filename = function() {
       paste0("dna_shearing_equations_", Sys.Date(), ".csv")
     },
     content = function(file) {
+      req(values$authenticated)
       write.csv(values$all_models, file, row.names = FALSE)
     }
   )
   
-  # example curves plot - GETTING RID OF THIS SOON
+  # example curves plot
   output$example_curves <- renderPlot({
-    req(values$all_models)
+    req(values$all_models, values$authenticated)
     
     models_df <- values$all_models
     successful <- models_df[!is.na(models_df$model_type) & models_df$status == "success", ]
@@ -832,7 +850,7 @@ server <- function(input, output, session) {
   # download protocol handler
   output$download_protocol <- downloadHandler(
     filename = function() {
-      req(input$device, input$vessel, input$volume, input$target_bp)
+      req(input$device, input$vessel, input$volume, input$target_bp, values$authenticated)
       paste0("DNA_Shearing_Protocol_", 
              gsub("[^A-Za-z0-9]", "_", input$device), "_",
              gsub("[^A-Za-z0-9]", "_", input$vessel), "_",
@@ -842,7 +860,7 @@ server <- function(input, output, session) {
     },
     
     content = function(file) {
-      req(values$current_model, values$data, input$volume)
+      req(values$current_model, values$data, input$volume, values$authenticated)
       
       # get prediction and protocol data
       pred <- predict_energy(values$current_model, input$target_bp)
@@ -907,7 +925,7 @@ server <- function(input, output, session) {
         )
       }
       
-      # add main protocol parameters - this download will be prettier in the future
+      # add main protocol parameters
       protocol_text <- c(protocol_text,
                          "========================================",
                          "        RECOMMENDED PROTOCOL",
