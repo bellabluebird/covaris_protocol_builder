@@ -1,14 +1,7 @@
 # dna shearing protocol builder v2
 # built by bella pfeiffer (bpfeiffer@covaris.com)
 # available here: https://bellabluebird.shinyapps.io/covaris_protocol_builder/
-# last updated: 7/21/25
-
-# bella - for SQLite database updates
-# > setwd("C:/Users/bpfeiffer/Desktop/programming_projects/Protocol_Builder_RShiny/app")
-# > con <- dbConnect(RSQLite::SQLite(), "data/database.sqlite")
-# > my_data <- read.csv("data/data_protocols_local.csv")
-# > dbWriteTable(con, "data_protocols", my_data, overwrite = TRUE)
-# > dbDisconnect(con)
+# last updated: 9/2/25
 
 # notes from 7/17 meeting
 # needs for future development (from Julie + Katelyn)
@@ -304,7 +297,7 @@ server <- function(input, output, session) {
             # target selection
             sliderInput("target_bp", "Target Base Pair (bp):", 
                         min = 100, max = 1500, value = 500, step = 25),
-            actionButton("calculate", "Calculate Energy", class = "btn-primary"),
+            actionButton("calculate", "Calculate Protocol", class = "btn-primary"),
             
             hr(),
             # simplified status display
