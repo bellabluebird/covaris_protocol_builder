@@ -3,28 +3,12 @@
 # available here: https://bellabluebird.shinyapps.io/covaris_protocol_builder/
 # last updated: 9/2/25
 
-# notes from 7/17 meeting
-# needs for future development (from Julie + Katelyn)
-#   - lack of protocol availability
-#     - large fragment shearing (400 - 1500 bp)
-#     - AFA tube TPX 520291
-#       - talk with Vanessa about truCOVER validation data 
-#     - pulsing protocols 
-#     - high priority instruments: R230, LE220, ML230
-#   - ability to map protocols between different devices + consumables, ie:
-#   - "we shear to xx on the ME220, how can we do that on the R230"
-#   - more consideration for sample volume
-#       - 50 in 130 !!
-#   - fragment analyzer comparison
-#       - planning an experiment to compare between different analyzers 
-#   - adding additional variables to protocols  (ie water level, z-height, etc)
-
 # load libraries
 if (!require(pacman)) {
   install.packages("pacman")
   library(pacman)
 }
-pacman::p_load(shiny, rsconnect, DBI, RSQLite, dplyr, digest)
+pacman::p_load(shiny, rsconnect, DBI, RSQLite, dplyr, digest, DT)
 
 # define column mappings 
 COLS <- list(
@@ -63,7 +47,10 @@ server <- function(input, output, session) {
     current_model = NULL,
     all_models = NULL,
     data_loaded = FALSE,
-    error_message = NULL
+    error_message = NULL,
+    comp_source_energy = NULL,
+    comp_vessel_options = NULL,
+    comp_results_ready = FALSE
   )
   
   # helper functions
@@ -242,6 +229,101 @@ server <- function(input, output, session) {
     )
   }
   
+  # PROTOCOL COMPARISON HELPER FUNCTIONS
+  
+  # calculate energy from manual protocol input
+  calculate_energy_from_protocol <- function(pip, duration, duty_factor) {
+    pip * duration * (duty_factor / 100)
+  }
+  
+  # find compatible volumes on target device
+  find_compatible_volumes <- function(data, target_device, source_volume, protocol_type) {
+    # get all vessel/volume combos for target device
+    device_data <- data[data[, COLS$device] == target_device, ]
+    
+    if(nrow(device_data) == 0) {
+      return(list(success = FALSE, message = "No data for target device"))
+    }
+    
+    # get unique vessel/volume combinations with sufficient data
+    vessel_volume_combos <- unique(device_data[, c(COLS$vessel, COLS$volume)])
+    vessel_volume_combos$volume_numeric <- as.numeric(vessel_volume_combos[, 2])
+    
+    # calculate volume differences
+    vessel_volume_combos$volume_diff <- abs(vessel_volume_combos$volume_numeric - source_volume)
+    vessel_volume_combos$volume_ratio <- vessel_volume_combos$volume_numeric / source_volume
+    
+    # check data availability for each combo
+    vessel_volume_combos$data_points <- 0
+    vessel_volume_combos$has_protocol_type <- FALSE
+    
+    for(i in 1:nrow(vessel_volume_combos)) {
+      filtered <- filter_data(data, target_device, 
+                              vessel_volume_combos[i, 1], 
+                              vessel_volume_combos[i, 2],
+                              protocol_type)
+      vessel_volume_combos$data_points[i] <- filtered$n_points
+      vessel_volume_combos$has_protocol_type[i] <- filtered$n_points >= 3
+    }
+    
+    # sort by volume similarity and data availability
+    vessel_volume_combos <- vessel_volume_combos[order(
+      !vessel_volume_combos$has_protocol_type,  # prioritize those with data
+      vessel_volume_combos$volume_diff          # then by volume similarity
+    ), ]
+    
+    list(
+      success = TRUE,
+      options = vessel_volume_combos,
+      exact_match = any(vessel_volume_combos$volume_diff == 0),
+      closest_volume = vessel_volume_combos$volume_numeric[1]
+    )
+  }
+  
+  # translate protocol between devices
+  translate_protocol <- function(source_energy, target_device, target_vessel, 
+                                 target_volume, protocol_type, data) {
+    # filter data for target combination
+    filtered <- filter_data(data, target_device, target_vessel, target_volume, protocol_type)
+    
+    if(filtered$n_points < 3) {
+      return(list(
+        success = FALSE, 
+        message = "Insufficient data for target device/vessel/volume combination"
+      ))
+    }
+    
+    # fit model for target
+    fit_result <- fit_best_model(filtered$bp, filtered$energy)
+    
+    if(!fit_result$success) {
+      return(list(success = FALSE, message = "Failed to fit model for target"))
+    }
+    
+    # reverse engineer BP from energy
+    model <- fit_result$model
+    coefs <- coef(model)
+    
+    # for power model: E = exp(a) * BP^b
+    # so: BP = (E / exp(a))^(1/b)
+    estimated_bp <- (source_energy / exp(coefs[1]))^(1/coefs[2])
+    
+    # calculate protocol for this energy
+    protocol <- calculate_protocol(source_energy, filtered)
+    
+    if(!protocol$success) {
+      return(list(success = FALSE, message = protocol$message))
+    }
+    
+    # add additional info
+    protocol$estimated_bp <- estimated_bp
+    protocol$target_energy <- source_energy
+    protocol$model_r2 <- summary(model)$r.squared
+    protocol$data_points <- filtered$n_points
+    
+    protocol
+  }
+  
   # authentication handlers
   observeEvent(input$login_btn, {
     if(check_password(input$password)) {
@@ -323,6 +405,145 @@ server <- function(input, output, session) {
                        )
               ),
               
+              # protocol comparison tab
+              tabPanel("Protocol Comparison",
+                       # Step 1: Source Protocol
+                       fluidRow(
+                         column(12,
+                                wellPanel(
+                                  h4("Step 1: Define Your Current Protocol"),
+                                  
+                                  fluidRow(
+                                    column(3,
+                                           selectInput("comp_source_device", "Device:",
+                                                       choices = list("Loading data..." = ""),
+                                                       width = "100%")),
+                                    column(3,
+                                           selectInput("comp_source_vessel", "Vessel:",
+                                                       choices = list("Select device first" = ""),
+                                                       width = "100%")),
+                                    column(3,
+                                           selectInput("comp_source_volume", "Volume:",
+                                                       choices = list("Select vessel first" = ""),
+                                                       width = "100%")),
+                                    column(3,
+                                           radioButtons("comp_protocol_type", "Type:",
+                                                        choices = c("Continuous" = "Continuous",
+                                                                    "Pulsing" = "Pulsing"),
+                                                        selected = "Continuous",
+                                                        inline = TRUE))
+                                  ),
+                                  
+                                  hr(),
+                                  
+                                  fluidRow(
+                                    column(6,
+                                           radioButtons("comp_input_method", "How do you know your protocol?",
+                                                        choices = c("I know my target BP" = "bp",
+                                                                    "I know my exact settings" = "manual"),
+                                                        selected = "bp"),
+                                           conditionalPanel(
+                                             condition = "input.comp_input_method == 'bp'",
+                                             sliderInput("comp_target_bp", "Target Fragment Size:", 
+                                                         min = 100, max = 1500, value = 500, 
+                                                         step = 25, post = " bp", width = "100%")
+                                           ),
+                                           conditionalPanel(
+                                             condition = "input.comp_input_method == 'manual'",
+                                             fluidRow(
+                                               column(4, numericInput("comp_manual_pip", "PIP (W):", 
+                                                                      value = 175, width = "100%")),
+                                               column(4, numericInput("comp_manual_duration", "Duration (s):", 
+                                                                      value = 60, width = "100%")),
+                                               column(4, numericInput("comp_manual_duty", "Duty (%):", 
+                                                                      value = 10, width = "100%"))
+                                             )
+                                           )
+                                    ),
+                                    column(6,
+                                           div(style = "background-color: #fff3cd; padding: 15px; border-radius: 5px;",
+                                               h5("Quick Tip"),
+                                               p("Select 'target BP' if you're designing a new protocol."),
+                                               p("Select 'exact settings' if you want to replicate an existing protocol on a different device."),
+                                               uiOutput("comp_energy_display")
+                                           )
+                                    )
+                                  )
+                                )
+                         )
+                       ),
+                       
+                       # Step 2: Target Device
+                       fluidRow(
+                         column(12,
+                                wellPanel(
+                                  h4("Step 2: Select Target Device"),
+                                  
+                                  fluidRow(
+                                    column(4,
+                                           selectInput("comp_target_device", "Target Device:",
+                                                       choices = list("Select source first" = ""),
+                                                       width = "100%")),
+                                    column(8,
+                                           div(style = "padding-top: 25px;",
+                                               actionButton("comp_calculate", 
+                                                            "Compare Protocols", 
+                                                            class = "btn-primary btn-lg", 
+                                                            style = "width: 100%;"))
+                                    )
+                                  )
+                                )
+                         )
+                       ),
+                       
+                       # Results Section
+                       conditionalPanel(
+                         condition = "output.show_comparison_results",
+                         
+                         fluidRow(
+                           column(12,
+                                  wellPanel(
+                                    h4("Comparison Results"),
+                                    
+                                    fluidRow(
+                                      column(6,
+                                             h5("Volume Compatibility"),
+                                             uiOutput("comp_volume_status"),
+                                             hr(),
+                                             h6("Available Options:"),
+                                             DT::dataTableOutput("comp_vessel_options_dt")
+                                      ),
+                                      column(6,
+                                             h5("Recommended Protocol"),
+                                             uiOutput("comp_protocol_display"),
+                                             hr(),
+                                             fluidRow(
+                                               column(6,
+                                                      downloadButton("download_comparison", 
+                                                                     "Download Report",
+                                                                     class = "btn-success", 
+                                                                     style = "width: 100%;")),
+                                               column(6,
+                                                      actionButton("copy_protocol", 
+                                                                   "Copy to Clipboard",
+                                                                   class = "btn-info", 
+                                                                   style = "width: 100%;"))
+                                             )
+                                      )
+                                    ),
+                                    
+                                    fluidRow(
+                                      column(12,
+                                             h5("Side-by-Side Comparison"),
+                                             DT::dataTableOutput("comp_summary_visual")
+                                      )
+                                    )
+                                  )
+                           )
+                         )
+                       )
+              ),
+              
               # equations overview tab
               tabPanel("All Models",
                        h4("Model Summary"),
@@ -356,6 +577,8 @@ server <- function(input, output, session) {
       devices <- devices[!is.na(devices)]
       if(length(devices) > 0) {
         updateSelectInput(session, "device", choices = devices, selected = devices[1])
+        # also update comparison source device dropdown
+        updateSelectInput(session, "comp_source_device", choices = devices, selected = devices[1])
       } else {
         values$error_message <- "No valid devices found in database"
       }
@@ -431,6 +654,90 @@ server <- function(input, output, session) {
     
     # calculate all models in background
     values$all_models <- calculate_all_models()
+  })
+  
+  # PROTOCOL COMPARISON EVENT HANDLERS
+  
+  # source device change handler
+  observeEvent(input$comp_source_device, {
+    req(values$data, input$comp_source_device, values$data_loaded, values$authenticated)
+    
+    # get vessels for this device
+    device_data <- values$data[values$data[, COLS$device] == input$comp_source_device, ]
+    vessels <- unique(device_data[, COLS$vessel])
+    vessels <- vessels[!is.na(vessels)]
+    updateSelectInput(session, "comp_source_vessel", choices = vessels, selected = vessels[1])
+    
+    # update target device dropdown (exclude source device)
+    all_devices <- unique(values$data[, COLS$device])
+    other_devices <- all_devices[all_devices != input$comp_source_device]
+    updateSelectInput(session, "comp_target_device", choices = other_devices, 
+                      selected = if(length(other_devices) > 0) other_devices[1] else "")
+  })
+  
+  # source vessel change handler
+  observeEvent(input$comp_source_vessel, {
+    req(values$data, input$comp_source_device, input$comp_source_vessel, values$data_loaded, values$authenticated)
+    
+    # get volumes for this device/vessel combination
+    device_vessel_data <- values$data[values$data[, COLS$device] == input$comp_source_device & 
+                                        values$data[, COLS$vessel] == input$comp_source_vessel, ]
+    volumes <- sort(unique(as.numeric(device_vessel_data[, COLS$volume])))
+    volumes <- volumes[!is.na(volumes)]
+    updateSelectInput(session, "comp_source_volume", choices = volumes, selected = volumes[1])
+  })
+  
+  # comparison calculation handler
+  observeEvent(input$comp_calculate, {
+    req(values$data, input$comp_source_device, input$comp_source_vessel, 
+        input$comp_source_volume, input$comp_target_device, values$data_loaded, values$authenticated)
+    
+    # calculate source energy
+    if(input$comp_input_method == "manual") {
+      # direct calculation from manual input
+      source_energy <- calculate_energy_from_protocol(
+        input$comp_manual_pip,
+        input$comp_manual_duration,
+        input$comp_manual_duty
+      )
+      values$comp_source_energy <- source_energy
+    } else {
+      # calculate from BP target
+      filtered <- filter_data(values$data, input$comp_source_device, 
+                              input$comp_source_vessel, as.numeric(input$comp_source_volume), 
+                              input$comp_protocol_type)
+      
+      if(filtered$n_points < 3) {
+        showNotification("Insufficient data for source device/vessel/volume", type = "error")
+        return()
+      }
+      
+      # fit model and predict
+      fit_result <- fit_best_model(filtered$bp, filtered$energy)
+      if(!fit_result$success) {
+        showNotification("Failed to fit model for source", type = "error")
+        return()
+      }
+      
+      pred <- predict_energy(fit_result$model, input$comp_target_bp)
+      values$comp_source_energy <- pred$fit
+    }
+    
+    # find compatible volumes on target device
+    volume_options <- find_compatible_volumes(
+      values$data, 
+      input$comp_target_device,
+      as.numeric(input$comp_source_volume),
+      input$comp_protocol_type
+    )
+    
+    if(!volume_options$success) {
+      showNotification(volume_options$message, type = "error")
+      return()
+    }
+    
+    values$comp_vessel_options <- volume_options$options
+    values$comp_results_ready <- TRUE
   })
   
   # calculate all models for export
@@ -515,6 +822,278 @@ server <- function(input, output, session) {
     
     do.call(rbind, results)
   })
+  
+  # PROTOCOL COMPARISON OUTPUT FUNCTIONS
+  
+  # show/hide results section
+  output$show_comparison_results <- reactive({
+    values$comp_results_ready
+  })
+  outputOptions(output, "show_comparison_results", suspendWhenHidden = FALSE)
+  
+  # energy display
+  output$comp_energy_display <- renderUI({
+    if(input$comp_input_method == "manual") {
+      energy <- calculate_energy_from_protocol(
+        input$comp_manual_pip,
+        input$comp_manual_duration,
+        input$comp_manual_duty
+      )
+      div(style = "background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 15px;",
+          h6("Calculated Energy:"),
+          p(style = "font-size: 18px; margin: 0;", 
+            strong(round(energy, 0), " J")))
+    } else {
+      if(!is.null(input$comp_target_bp)) {
+        div(style = "background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 15px;",
+            h6("Target Fragment Size:"),
+            p(style = "font-size: 18px; margin: 0;", 
+              strong(input$comp_target_bp, " bp")))
+      }
+    }
+  })
+  
+  # volume status display
+  output$comp_volume_status <- renderUI({
+    req(values$comp_vessel_options)
+    
+    options <- values$comp_vessel_options
+    source_vol <- as.numeric(input$comp_source_volume)
+    
+    if(options[1, "volume_diff"] == 0) {
+      div(
+        p(style = "color: #28a745; font-weight: bold;", 
+          "✓ Exact volume match found!"),
+        p(paste("Using", options[1, "volume_numeric"], "μL in", options[1, 1]))
+      )
+    } else {
+      div(
+        p(style = "color: #ffc107; font-weight: bold;", 
+          "⚠ No exact volume match"),
+        p(paste("Source:", source_vol, "μL → Closest:", 
+                options[1, "volume_numeric"], "μL")),
+        p(paste("Volume ratio:", round(options[1, "volume_ratio"], 2))),
+        p(style = "font-size: 12px; color: #6c757d;", 
+          "Note: Energy calculations assume similar efficiency across volumes.")
+      )
+    }
+  })
+  
+  # vessel options DataTable
+  output$comp_vessel_options_dt <- DT::renderDataTable({
+    req(values$comp_vessel_options)
+    
+    options <- values$comp_vessel_options
+    display_df <- data.frame(
+      Vessel = options[, 1],
+      Volume = paste0(options$volume_numeric, " μL"),
+      `Match` = ifelse(options$volume_diff == 0, "Exact", 
+                       paste0("+", round(options$volume_diff, 1), " μL")),
+      `Points` = options$data_points,
+      Status = ifelse(options$has_protocol_type, 
+                      '<span style="color: #28a745;">✓ Ready</span>', 
+                      '<span style="color: #dc3545;">✗ No data</span>'),
+      stringsAsFactors = FALSE
+    )
+    
+    DT::datatable(head(display_df, 5), 
+                  options = list(
+                    dom = 't',
+                    pageLength = 5,
+                    ordering = FALSE,
+                    searching = FALSE,
+                    paging = FALSE,
+                    info = FALSE
+                  ),
+                  escape = FALSE,
+                  rownames = FALSE)
+  }, server = FALSE)
+  
+  # protocol display
+  output$comp_protocol_display <- renderUI({
+    req(values$comp_source_energy, values$comp_vessel_options)
+    
+    best_option <- values$comp_vessel_options[1, ]
+    
+    if(!best_option$has_protocol_type) {
+      return(div(
+        p(style = "color: #dc3545; font-weight: bold;", 
+          "✗ Insufficient data"),
+        p(paste("No protocol data for", input$comp_target_device, 
+                "-", best_option[, 1], "-", best_option$volume_numeric, "μL"))
+      ))
+    }
+    
+    # translate protocol
+    result <- translate_protocol(
+      values$comp_source_energy,
+      input$comp_target_device,
+      best_option[, 1],
+      best_option$volume_numeric,
+      input$comp_protocol_type,
+      values$data
+    )
+    
+    if(!result$success) {
+      return(div(
+        p(style = "color: #dc3545; font-weight: bold;", 
+          "✗ Translation failed"),
+        p(result$message)
+      ))
+    }
+    
+    # create protocol display
+    tagList(
+      div(style = "background-color: #d4edda; padding: 10px; border-radius: 5px; margin-bottom: 15px;",
+          p(style = "color: #28a745; font-weight: bold; margin: 0;",
+            "✓ Protocol successfully translated!")),
+      
+      fluidRow(
+        column(6,
+               p(strong("PIP:"), br(), 
+                 span(style = "font-size: 18px;", round(result$pip, 1), " W"))),
+        column(6,
+               p(strong("Duration:"), br(), 
+                 span(style = "font-size: 18px;", round(result$duration, 1), " s")))
+      ),
+      fluidRow(
+        column(6,
+               p(strong("Duty Factor:"), br(), 
+                 span(style = "font-size: 18px;", round(result$duty_factor, 0), "%"))),
+        column(6,
+               p(strong("Energy:"), br(), 
+                 span(style = "font-size: 18px;", round(result$calculated_energy, 0), " J")))
+      ),
+      
+      hr(),
+      
+      div(style = "background-color: #f8f9fa; padding: 10px; border-radius: 5px;",
+          p(strong("Confidence Metrics:")),
+          p(style = "margin: 5px 0;", 
+            "Model R²: ", strong(round(result$model_r2, 3))),
+          p(style = "margin: 5px 0;", 
+            "Data points: ", strong(result$data_points)),
+          p(style = "margin: 5px 0;", 
+            "Est. BP: ", strong(round(result$estimated_bp, 0), " bp"))
+      ),
+      
+      if(length(result$warnings) > 0) {
+        div(style = "margin-top: 10px;",
+            p(style = "color: #ffc107; font-weight: bold;", 
+              "⚠ Warnings:"),
+            tags$ul(
+              lapply(result$warnings, function(w) tags$li(w))
+            ))
+      }
+    )
+  })
+  
+  # comparison summary visual
+  output$comp_summary_visual <- DT::renderDataTable({
+    req(values$comp_source_energy, values$comp_vessel_options)
+    
+    # create comparison data
+    comparison_data <- data.frame(
+      Parameter = character(),
+      Source = character(),
+      Target = character(),
+      stringsAsFactors = FALSE
+    )
+    
+    # basic info
+    comparison_data <- rbind(comparison_data,
+                             data.frame(
+                               Parameter = "Device",
+                               Source = input$comp_source_device,
+                               Target = input$comp_target_device
+                             ))
+    
+    comparison_data <- rbind(comparison_data,
+                             data.frame(
+                               Parameter = "Vessel",
+                               Source = input$comp_source_vessel,
+                               Target = values$comp_vessel_options[1, 1]
+                             ))
+    
+    comparison_data <- rbind(comparison_data,
+                             data.frame(
+                               Parameter = "Volume",
+                               Source = paste0(input$comp_source_volume, " μL"),
+                               Target = paste0(values$comp_vessel_options[1, "volume_numeric"], " μL")
+                             ))
+    
+    comparison_data <- rbind(comparison_data,
+                             data.frame(
+                               Parameter = "Protocol Type",
+                               Source = input$comp_protocol_type,
+                               Target = input$comp_protocol_type
+                             ))
+    
+    # energy info
+    comparison_data <- rbind(comparison_data,
+                             data.frame(
+                               Parameter = "Target Energy",
+                               Source = paste0(round(values$comp_source_energy, 0), " J"),
+                               Target = ""
+                             ))
+    
+    # try to get protocol details
+    best_option <- values$comp_vessel_options[1, ]
+    if(best_option$has_protocol_type) {
+      result <- translate_protocol(
+        values$comp_source_energy,
+        input$comp_target_device,
+        best_option[, 1],
+        best_option$volume_numeric,
+        input$comp_protocol_type,
+        values$data
+      )
+      
+      if(result$success) {
+        comparison_data[comparison_data$Parameter == "Target Energy", "Target"] <- 
+          paste0(round(result$calculated_energy, 0), " J")
+        
+        # add protocol parameters
+        comparison_data <- rbind(comparison_data,
+                                 data.frame(
+                                   Parameter = "PIP",
+                                   Source = ifelse(input$comp_input_method == "manual",
+                                                   paste0(input$comp_manual_pip, " W"),
+                                                   "Calculated"),
+                                   Target = paste0(round(result$pip, 1), " W")
+                                 ))
+        
+        comparison_data <- rbind(comparison_data,
+                                 data.frame(
+                                   Parameter = "Duration",
+                                   Source = ifelse(input$comp_input_method == "manual",
+                                                   paste0(input$comp_manual_duration, " s"),
+                                                   "Calculated"),
+                                   Target = paste0(round(result$duration, 1), " s")
+                                 ))
+        
+        comparison_data <- rbind(comparison_data,
+                                 data.frame(
+                                   Parameter = "Duty Factor",
+                                   Source = ifelse(input$comp_input_method == "manual",
+                                                   paste0(input$comp_manual_duty, "%"),
+                                                   "Calculated"),
+                                   Target = paste0(round(result$duty_factor, 0), "%")
+                                 ))
+      }
+    }
+    
+    DT::datatable(comparison_data,
+                  options = list(
+                    dom = 't',
+                    pageLength = 20,
+                    ordering = FALSE,
+                    searching = FALSE,
+                    paging = FALSE,
+                    info = FALSE
+                  ),
+                  rownames = FALSE)
+  }, server = FALSE)
   
   # model summary
   output$model_summary <- renderPrint({
@@ -996,6 +1575,180 @@ server <- function(input, output, session) {
       writeLines(protocol_text, file)
     }
   )
+  
+  # PROTOCOL COMPARISON DOWNLOAD HANDLERS
+  
+  # download comparison report
+  output$download_comparison <- downloadHandler(
+    filename = function() {
+      paste0("Protocol_Comparison_",
+             input$comp_source_device, "_to_",
+             input$comp_target_device, "_",
+             Sys.Date(), ".txt")
+    },
+    content = function(file) {
+      req(values$authenticated)
+      # comprehensive comparison report
+      report_lines <- c(
+        "========================================",
+        "     PROTOCOL COMPARISON REPORT",
+        "========================================",
+        "",
+        paste("Generated:", Sys.time()),
+        paste("Protocol Builder v2 - Covaris"),
+        "",
+        "SOURCE PROTOCOL",
+        "---------------",
+        paste("Device:", input$comp_source_device),
+        paste("Vessel:", input$comp_source_vessel),
+        paste("Volume:", input$comp_source_volume, "μL"),
+        paste("Protocol Type:", input$comp_protocol_type),
+        paste("Target Energy:", round(values$comp_source_energy, 0), "J"),
+        ""
+      )
+      
+      if(input$comp_input_method == "manual") {
+        report_lines <- c(report_lines,
+                          "Source Protocol Parameters:",
+                          paste("  PIP:", input$comp_manual_pip, "W"),
+                          paste("  Duration:", input$comp_manual_duration, "s"),
+                          paste("  Duty Factor:", input$comp_manual_duty, "%"),
+                          "")
+      } else {
+        report_lines <- c(report_lines,
+                          paste("Target BP:", input$comp_target_bp, "bp"),
+                          "")
+      }
+      
+      # add target device info
+      report_lines <- c(report_lines,
+                        "TARGET DEVICE ANALYSIS",
+                        "---------------------",
+                        paste("Target Device:", input$comp_target_device),
+                        "")
+      
+      # add vessel options
+      if(!is.null(values$comp_vessel_options)) {
+        options <- head(values$comp_vessel_options, 5)
+        report_lines <- c(report_lines,
+                          "Compatible Vessel/Volume Options:",
+                          "")
+        
+        for(i in 1:nrow(options)) {
+          report_lines <- c(report_lines,
+                            paste0(i, ". ", options[i, 1], " - ", 
+                                   options[i, "volume_numeric"], " μL",
+                                   " (", ifelse(options[i, "has_protocol_type"], 
+                                                "Available", "No data"), ")"))
+        }
+        
+        report_lines <- c(report_lines, "")
+        
+        # add best recommendation
+        best_option <- options[1, ]
+        if(best_option$has_protocol_type) {
+          result <- translate_protocol(
+            values$comp_source_energy,
+            input$comp_target_device,
+            best_option[, 1],
+            best_option$volume_numeric,
+            input$comp_protocol_type,
+            values$data
+          )
+          
+          if(result$success) {
+            report_lines <- c(report_lines,
+                              "========================================",
+                              "       RECOMMENDED PROTOCOL",
+                              "========================================",
+                              "",
+                              paste("Device:", input$comp_target_device),
+                              paste("Vessel:", best_option[, 1]),
+                              paste("Volume:", best_option$volume_numeric, "μL"),
+                              "",
+                              "Protocol Parameters:",
+                              paste("  Peak Incident Power:", round(result$pip, 1), "W"),
+                              paste("  Duration:", round(result$duration, 1), "s"),
+                              paste("  Duty Factor:", round(result$duty_factor, 0), "%"),
+                              paste("  Water Level:", result$water_level),
+                              paste("  Z-Height:", result$z_height),
+                              paste("  Dither:", result$dither),
+                              paste("  Calculated Energy:", round(result$calculated_energy, 0), "J"),
+                              "",
+                              "Validation Metrics:",
+                              paste("  Estimated BP:", round(result$estimated_bp, 0), "bp"),
+                              paste("  Model R²:", round(result$model_r2, 3)),
+                              paste("  Training data points:", result$data_points),
+                              "")
+            
+            if(length(result$warnings) > 0) {
+              report_lines <- c(report_lines,
+                                "⚠️ Warnings:",
+                                paste("  ", result$warnings),
+                                "")
+            }
+          }
+        }
+      }
+      
+      report_lines <- c(report_lines,
+                        "========================================",
+                        "             IMPORTANT NOTES",
+                        "========================================",
+                        "",
+                        "1. Protocol translation assumes similar efficiency across devices",
+                        "2. Always validate results experimentally",
+                        "3. Volume differences may affect shearing efficiency",
+                        "4. Consider vessel-specific factors (geometry, material)",
+                        "",
+                        "For technical support: bpfeiffer@covaris.com",
+                        "")
+      
+      writeLines(report_lines, file)
+    }
+  )
+  
+  # copy to clipboard handler
+  observeEvent(input$copy_protocol, {
+    req(values$comp_source_energy, values$comp_vessel_options, values$authenticated)
+    
+    best_option <- values$comp_vessel_options[1, ]
+    if(!best_option$has_protocol_type) {
+      showNotification("No protocol available to copy", type = "error")
+      return()
+    }
+    
+    result <- translate_protocol(
+      values$comp_source_energy,
+      input$comp_target_device,
+      best_option[, 1],
+      best_option$volume_numeric,
+      input$comp_protocol_type,
+      values$data
+    )
+    
+    if(!result$success) {
+      showNotification("Protocol translation failed", type = "error")
+      return()
+    }
+    
+    # create simple protocol text for clipboard
+    protocol_text <- paste(
+      "Device:", input$comp_target_device,
+      "\nVessel:", best_option[, 1],
+      "\nVolume:", best_option$volume_numeric, "μL",
+      "\nPIP:", round(result$pip, 1), "W",
+      "\nDuration:", round(result$duration, 1), "s",
+      "\nDuty Factor:", round(result$duty_factor, 0), "%",
+      "\nWater Level:", result$water_level,
+      "\nZ-Height:", result$z_height,
+      "\nDither:", result$dither,
+      "\nEnergy:", round(result$calculated_energy, 0), "J"
+    )
+    
+    # TODO: clipboard functionality requires additional JS
+    showNotification("Protocol details displayed - copy manually from the display", type = "info")
+  })
 }
 
 # run app
